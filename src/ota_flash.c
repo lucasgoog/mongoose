@@ -74,7 +74,7 @@ bool mg_ota_end(void) {
   bool ok = false;
   if (s_size) {
     size_t size = s_addr - base;
-    uint32_t crc32 = mg_crc32(0, base, s_size);
+    uint32_t crc32 = mg_crc32(0, base + MG_FLASH_OFFSET, s_size);
     if (size == s_size && crc32 == s_crc32) {
       uint32_t now = (uint32_t) (mg_now() / 1000);
       struct mg_otadata od = {crc32, size, now, MG_OTA_FIRST_BOOT};
@@ -187,13 +187,123 @@ MG_IRAM void mg_ota_boot(void) {
     (void) tmpsector;
     for (ofs = 0; ofs < max; ofs += ss) {
       // mg_flash_erase(tmpsector);
-      mg_flash_write(tmpsector, partition1 + ofs, ss);
+      mg_flash_write(tmpsector, partition1 + ofs + MG_FLASH_OFFSET, ss);
       // mg_flash_erase(partition1 + ofs);
-      mg_flash_write(partition1 + ofs, partition2 + ofs, ss);
+      mg_flash_write(partition1 + ofs, partition2 + ofs + MG_FLASH_OFFSET, ss);
       // mg_flash_erase(partition2 + ofs);
-      mg_flash_write(partition2 + ofs, tmpsector, ss);
+      mg_flash_write(partition2 + ofs, tmpsector + MG_FLASH_OFFSET, ss);
     }
     mg_device_reset();
   }
 }
+
+#elif MG_OTA == MG_OTA_FLASH_FROM_RAM
+
+#define MG_OTADATA_KEY 0xb07afed0
+
+static char *s_addr;      // Current address to write to
+static size_t s_size;     // Firmware size to flash. In-progress indicator
+static uint32_t s_crc32;  // Firmware checksum
+
+struct mg_otadata {
+  uint32_t crc32, size, timestamp, status;
+};
+
+bool mg_ota_begin(size_t new_firmware_size) {
+  bool ok = false;
+  if (s_size) {
+    MG_ERROR(("OTA already in progress. Call mg_ota_end()"));
+  } else {
+    if (new_firmware_size > mg_flash_size()) {
+      MG_ERROR(("Firmware exceeds flash size"));
+      return false;
+    }
+    s_size = new_firmware_size;
+    uint32_t flash_init_status = mg_flash_init();
+    if (flash_init_status) {
+      MG_ERROR(("Error initialising the flash structure"));
+      return false;
+    } else {
+      ok = true;
+    }
+  }
+  return ok;
+}
+
+bool mg_ota_write(const void *buf, size_t len) {
+  bool ok = false;
+  if (s_size == 0) {
+    MG_ERROR(("OTA is not started, call mg_ota_begin()"));
+  } else {
+    size_t align = mg_flash_write_align();
+    size_t len_aligned_down = MG_ROUND_DOWN(len, align);
+    if (len_aligned_down) ok = mg_flash_write(s_addr, buf, len_aligned_down);
+    if (len_aligned_down < len) {
+      size_t left = len - len_aligned_down;
+      char tmp[align];
+      memset(tmp, 0xff, sizeof(tmp));
+      memcpy(tmp, (char *) buf + len_aligned_down, left);
+      ok = mg_flash_write(s_addr + len_aligned_down, tmp, sizeof(tmp));
+    }
+    s_crc32 = mg_crc32(s_crc32, (char *) buf, len);  // Update CRC
+    MG_DEBUG(("%#x %p %lu -> %d", s_addr, buf, len, ok));
+    s_addr += len;
+  }
+  return ok;
+}
+
+bool mg_ota_end(void) {
+  bool ok = true;
+  size_t size = (size_t) s_addr;
+  uint32_t crc32 = mg_crc32(0, (char *) 0x60000000, size);
+  MG_DEBUG(("Saving fw key"));
+  if (size == s_size && crc32 == s_crc32) {
+      uint32_t now = (uint32_t) (mg_now() / 1000);
+      struct mg_otadata od = {crc32, size, now, MG_OTA_FIRST_BOOT};
+      uint32_t key = MG_OTADATA_KEY + MG_FIRMWARE_CURRENT;
+      ok = mg_flash_save(NULL, key, &od, sizeof(od));
+    }
+  MG_DEBUG(("CRC: %x/%x, size: %lu/%lu, status: %s", s_crc32, crc32, s_size,
+              size, s_crc32 == crc32 ? "ok" : "fail"));
+  s_addr = 0;
+  s_size = 0;
+  MG_INFO(("Finishing OTA: %s", ok ? "ok" : "fail"));
+  return ok;
+}
+
+static struct mg_otadata mg_otadata(int fw) {
+  (void) fw;
+  struct mg_otadata od = {};
+  return od;
+}
+
+int mg_ota_status(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.status;
+}
+
+uint32_t mg_ota_crc32(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.crc32;
+}
+
+uint32_t mg_ota_timestamp(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.timestamp;
+}
+
+size_t mg_ota_size(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.size;
+}
+
+bool mg_ota_commit(void) {
+  return false;
+}
+
+bool mg_ota_rollback(void) {
+  MG_DEBUG(("Rolling firmware not supported yet"));
+  return false;
+}
+
 #endif

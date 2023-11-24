@@ -8,13 +8,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-typedef struct _lut_sequence
-{
-    uint8_t seqNum; //!< Sequence Number, valid number: 1-16
-    uint8_t seqId;  //!< Sequence Index, valid number: 0-15
-    uint16_t reserved;
-} flexspi_lut_seq_t;
-
 typedef struct _FlexSPIConfig
 {
     uint32_t tag;               //!< [0x000-0x003] Tag, fixed value 0x42464346UL
@@ -30,12 +23,12 @@ typedef struct _FlexSPIConfig
     //! Generic configuration, etc.
     uint16_t waitTimeCfgCommands; //!< [0x012-0x013] Wait time for all configuration commands, unit: 100us, Used for
     //! DPI/QPI/OPI switch or reset command
-    flexspi_lut_seq_t deviceModeSeq; //!< [0x014-0x017] Device mode sequence info, [7:0] - LUT sequence id, [15:8] - LUt
+    uint32_t deviceModeSeq; //!< [0x014-0x017] Device mode sequence info, [7:0] - LUT sequence id, [15:8] - LUt
     //! sequence number, [31:16] Reserved
     uint32_t deviceModeArg;    //!< [0x018-0x01b] Argument/Parameter for device configuration
     uint8_t configCmdEnable;   //!< [0x01c-0x01c] Configure command Enable Flag, 1 - Enable, 0 - Disable
     uint8_t configModeType[3]; //!< [0x01d-0x01f] Configure Mode Type, similar as deviceModeTpe
-    flexspi_lut_seq_t
+    uint32_t
         configCmdSeqs[3]; //!< [0x020-0x02b] Sequence info for Device Configuration command, similar as deviceModeSeq
     uint32_t reserved1;   //!< [0x02c-0x02f] Reserved for future use
     uint32_t configCmdArgs[3];     //!< [0x030-0x03b] Arguments/Parameters for device Configuration commands
@@ -64,7 +57,7 @@ typedef struct _FlexSPIConfig
     uint16_t busyBitPolarity;  //!< [0x07e-0x07f] Busy flag polarity, 0 - busy flag is 1 when flash device is busy, 1 -
     //! busy flag is 0 when flash device is busy
     uint32_t lookupTable[64];           //!< [0x080-0x17f] Lookup table holds Flash command sequences
-    flexspi_lut_seq_t lutCustomSeq[12]; //!< [0x180-0x1af] Customizable LUT Sequences
+    uint32_t lutCustomSeq[12]; //!< [0x180-0x1af] Customizable LUT Sequences
     uint32_t reserved4[4];              //!< [0x1b0-0x1bf] Reserved for future use
 } flexspi_mem_config_t;
 
@@ -120,3 +113,35 @@ typedef struct _flexspi_nor_config
                     [4 * 9 + 1] = FLEXSPI_LUT_SEQ(WRITE_SDR, FLEXSPI_1PAD, 0x04, STOP, FLEXSPI_1PAD, 0x0),\
                     [4 * 11 + 0] = FLEXSPI_LUT_SEQ(CMD_SDR, FLEXSPI_1PAD, 0x60, STOP, FLEXSPI_1PAD, 0x0),\
 }
+
+typedef struct {
+  uint32_t version;
+  int (*init)(uint32_t instance, flexspi_nor_config_t *config);
+  int (*program)(uint32_t instance, flexspi_nor_config_t *config,
+                      uint32_t dst_addr, const uint32_t *src);
+  int (*erase_all)(uint32_t instance, flexspi_nor_config_t *config);
+  int (*erase)(uint32_t instance, flexspi_nor_config_t *config,
+                    uint32_t start, uint32_t lengthInBytes);
+  int (*read)(uint32_t instance, flexspi_nor_config_t *config,
+                   uint32_t *dst, uint32_t addr, uint32_t lengthInBytes);
+  void (*clear_cache)(uint32_t instance);
+  int (*xfer)(uint32_t instance, char *xfer);
+  int (*update_lut)(uint32_t instance, uint32_t seqIndex,
+                         const uint32_t *lutBase, uint32_t seqNumber);
+  int (*get_config)(uint32_t instance, flexspi_nor_config_t *config,
+                         uint32_t *option);
+} flexspi_nor_driver_interface_t;
+
+typedef struct {
+  const uint32_t version;  // Bootloader version number
+  const char *copyright;   // Bootloader Copyright
+  void (*runBootloader)(
+      void *arg);             // Function to start the bootloader executing
+  const uint32_t *reserved0;  // Reserved
+  const flexspi_nor_driver_interface_t
+      *flexSpiNorDriver;         // FlexSPI NOR Flash API
+  const uint32_t *reserved1[2];  // Reserved
+} bootloader_api_entry_t;
+
+#define bootloader (*(bootloader_api_entry_t **) (0x0020001c))
+#define flexspi_nor bootloader->flexSpiNorDriver

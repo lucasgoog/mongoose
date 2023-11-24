@@ -22,6 +22,7 @@ void mg_random(void *buf, size_t len) {  // Use on-board RNG
     memcpy((char *) buf + n, &r, n + sizeof(r) > len ? len - n : sizeof(r));
   }
 }
+
 static void timer_fn(void *arg) {
   gpio_toggle(LED);                                      // Blink LED
   struct mg_tcpip_if *ifp = arg;                         // And show
@@ -32,15 +33,42 @@ static void timer_fn(void *arg) {
 }
 
 int main(void) {
-  gpio_output(LED);               // Setup blue LED
+  gpio_output(LED);               // Setup green LED
   uart_init(UART_DEBUG, 115200);  // Initialise debug printf
   ethernet_init();                // Initialise ethernet pins
+
+  #ifdef MQTT_DASHBOARD
+    // User can customise the MQTT url, device ID or the root topic below
+  #define DEVICE_ID "RT1060"
+    g_url = MQTT_SERVER_URL;
+    g_device_id = DEVICE_ID;
+    g_root_topic = DEFAULT_ROOT_TOPIC;
+  #endif
+
   MG_INFO(("Starting, CPU freq %g MHz", (double) SystemCoreClock / 1000000));
 
   struct mg_mgr mgr;        // Initialise
   mg_mgr_init(&mgr);        // Mongoose event manager
   mg_log_set(MG_LL_DEBUG);  // Set log level
 
+  //mg_ota_boot();  // Call bootloader: continue to load, or boot another FW
+
+#if MG_OTA == MG_OTA_FLASH
+  // Demonstrate the use of mg_flash_{load/save} functions for keeping device
+  // configuration data on flash. Increment boot count on every boot.
+  struct deviceconfig {
+    uint32_t boot_count;
+    char some_other_data[40];
+  };
+  uint32_t key = 0x12345678;    // A unique key, one per data type
+  struct deviceconfig dc = {};  // Initialise to some default values
+  mg_flash_load(NULL, key, &dc, sizeof(dc));  // Load from flash
+  dc.boot_count++;                            // Increment boot count
+  mg_flash_save(NULL, key, &dc, sizeof(dc));  // And save back
+  MG_INFO(("Boot count: %u", dc.boot_count));
+#endif
+
+  // Initialise Mongoose network stack
   // Initialise Mongoose network stack
   struct mg_tcpip_driver_imxrt_data driver_data = {.mdc_cr = 24, .phy_addr = 2};
   struct mg_tcpip_if mif = {.mac = GENERATE_LOCALLY_ADMINISTERED_MAC(),
@@ -65,6 +93,6 @@ int main(void) {
   for (;;) {
     mg_mgr_poll(&mgr, 0);
   }
-
   return 0;
 }
+

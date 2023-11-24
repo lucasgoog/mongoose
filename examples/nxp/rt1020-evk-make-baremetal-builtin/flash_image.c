@@ -1,6 +1,6 @@
 #include "dcd.h"      // pin settings for MIMXRT1020-EVK board
-#include "flexspi.h"  // peripheral structures
 #include "hal.h"
+#include "flexspi.h"  // peripheral structures
 
 extern uint32_t __isr_vector[];
 

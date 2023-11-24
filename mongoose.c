@@ -239,7 +239,8 @@ void mg_device_reset(void) {
 #endif
 
 
-#if MG_DEVICE == MG_DEVICE_STM32H7 || MG_DEVICE == MG_DEVICE_STM32H5
+#if MG_DEVICE == MG_DEVICE_STM32H7 || MG_DEVICE == MG_DEVICE_STM32H5 || \
+    MG_DEVICE == MG_DEVICE_RT1020 || MG_DEVICE == MG_DEVICE_RT1060
 // Flash can be written only if it is erased. Erased flash is 0xff (all bits 1)
 // Writes must be mg_flash_write_align() - aligned. Thus if we want to save an
 // object, we pad it at the end for alignment.
@@ -272,10 +273,11 @@ static char *flash_last_sector(void) {
 
 // Find a saved object with a given key
 bool mg_flash_load(void *sector, uint32_t key, void *buf, size_t len) {
-  char *base = (char *) mg_flash_start(), *s = (char *) sector, *res = NULL;
+  char *base = (char *) mg_flash_start() + MG_FLASH_OFFSET;
+  char *s = (char *) sector, *res = NULL;
   size_t ss = mg_flash_sector_size(), ofs = 0, n, sz;
   bool ok = false;
-  if (s == NULL) s = flash_last_sector();
+  if (sector == NULL) s = flash_last_sector() + MG_FLASH_OFFSET;
   if (s < base || s >= base + mg_flash_size()) {
     MG_ERROR(("%p is outsize of flash", sector));
   } else if (((s - base) % ss) != 0) {
@@ -307,7 +309,8 @@ static void mg_flash_sector_cleanup(char *sector) {
   uint32_t key;
   // Traverse all objects
   MG_DEBUG(("Cleaning up sector %p", sector));
-  while ((n = mg_flash_next(sector + ofs, sector + ss, &key, &size)) > 0) {
+  while ((n = mg_flash_next(sector + ofs + MG_FLASH_OFFSET,
+                            sector + ss + MG_FLASH_OFFSET, &key, &size)) > 0) {
     // Delete an old copy of this object in the cache
     for (size_t o = 0; o < io.len; o += size2 + hs) {
       uint32_t k = *(uint32_t *) (io.buf + o + sizeof(uint32_t));
@@ -318,7 +321,7 @@ static void mg_flash_sector_cleanup(char *sector) {
       }
     }
     // And add the new copy
-    mg_iobuf_add(&io, io.len, sector + ofs, size + hs);
+    mg_iobuf_add(&io, io.len, sector + ofs + MG_FLASH_OFFSET, size + hs);
     ofs += n;
   }
   // All objects are cached in RAM now
@@ -347,13 +350,17 @@ bool mg_flash_save(void *sector, uint32_t key, const void *buf, size_t len) {
     uint32_t hdr[2] = {(uint32_t) len, key};
     size_t needed = sizeof(hdr) + len;
     size_t needed_aligned = MG_ROUND_UP(needed, sizeof(ab));
-    while ((n = mg_flash_next(s + ofs, s + ss, NULL, NULL)) > 0) ofs += n;
+    while ((n = mg_flash_next(s + ofs + MG_FLASH_OFFSET,
+                              s + ss + MG_FLASH_OFFSET, NULL, NULL)) > 0)
+      ofs += n;
 
     // If there is not enough space left, cleanup sector and re-eval ofs
-    if (ofs + needed_aligned > ss) {
+    if (ofs + needed_aligned >= ss) {
       mg_flash_sector_cleanup(s);
       ofs = 0;
-      while ((n = mg_flash_next(s + ofs, s + ss, NULL, NULL)) > 0) ofs += n;
+      while ((n = mg_flash_next(s + ofs + MG_FLASH_OFFSET,
+                                s + ss + MG_FLASH_OFFSET, NULL, NULL)) > 0)
+        ofs += n;
     }
 
     if (ofs + needed_aligned <= ss) {
@@ -407,6 +414,223 @@ bool mg_flash_load(void *sector, uint32_t key, void *buf, size_t len) {
   (void) sector, (void) key, (void) buf, (void) len;
   return false;
 }
+#endif
+
+#ifdef MG_ENABLE_LINES
+#line 1 "src/device_imxrt.c"
+#endif
+
+
+
+#if MG_DEVICE == MG_DEVICE_RT1020 || MG_DEVICE == MG_DEVICE_RT1060
+
+#include <flexspi.h>
+#define FLEXSPI_NOR_INSTANCE 0
+
+static bool s_flash_irq_disabled;
+
+MG_IRAM void *mg_flash_start(void) {
+  return (void *) 0x0;
+}
+MG_IRAM size_t mg_flash_size(void) {
+  return 8 * 1024 * 1024;
+}
+MG_IRAM size_t mg_flash_sector_size(void) {
+  return 4 * 1024;  // 4k
+}
+MG_IRAM size_t mg_flash_write_align(void) {
+  return 256;
+}
+MG_IRAM int mg_flash_bank(void) {
+  return 0;
+}
+
+MG_IRAM static bool flash_page_start(volatile uint32_t *dst) {
+  char *base = (char *) mg_flash_start(), *end = base + mg_flash_size();
+  volatile char *p = (char *) dst;
+  return p >= base && p < end && ((p - base) % mg_flash_sector_size()) == 0;
+}
+
+#if MG_DEVICE == MG_DEVICE_RT1020
+MG_IRAM static int flexspi_nor_get_config(flexspi_nor_config_t *config) {
+  flexspi_nor_config_t default_config = {
+      .memConfig = {.tag = FLEXSPI_CFG_BLK_TAG,
+                    .version = FLEXSPI_CFG_BLK_VERSION,
+                    .readSampleClkSrc = 1,  // ReadSampleClk_LoopbackFromDqsPad
+                    .csHoldTime = 3,
+                    .csSetupTime = 3,
+                    .controllerMiscOption = MG_BIT(4),
+                    .deviceType = 1,  // serial NOR
+                    .sflashPadType = 4,
+                    .serialClkFreq = 7,  // 133MHz
+                    .sflashA1Size = 8 * 1024 * 1024,
+                    .lookupTable = __FLEXSPI_QSPI_LUT},
+      .pageSize = 256,
+      .sectorSize = 4 * 1024,
+      .ipcmdSerialClkFreq = 1,
+      .blockSize = 64 * 1024,
+      .isUniformBlockSize = false};
+
+  *config = default_config;
+  return 0;
+}
+#else
+MG_IRAM static int flexspi_nor_get_config(flexspi_nor_config_t *config) {
+  uint32_t options[] = {0xc0000008, 0x00};
+  uint32_t status =
+      flexspi_nor->get_config(FLEXSPI_NOR_INSTANCE, config, options);
+  if (status) {
+    MG_ERROR(("Failed to extract flash configuration: status %u", status));
+  }
+  return status;
+}
+#endif
+
+uint32_t mg_flash_init() {
+  flexspi_nor_config_t config;
+  if (flexspi_nor_get_config(&config) != 0) {
+    return false;
+  }
+  return flexspi_nor->init(FLEXSPI_NOR_INSTANCE, &config);
+}
+
+MG_IRAM bool mg_flash_erase(void *addr) {
+  flexspi_nor_config_t config;
+  if (flexspi_nor_get_config(&config) != 0) {
+    return false;
+  }
+  if (flash_page_start(addr) == false) {
+    MG_ERROR(("%p is not on a sector boundary", addr));
+    return false;
+  }
+  // Note: Interrupts must be disabled before any call to the ROM API on RT1020
+  if (!s_flash_irq_disabled) {
+    asm("cpsid i");
+  }
+  bool ok = (flexspi_nor->erase(FLEXSPI_NOR_INSTANCE, &config, (uint32_t) addr,
+                                mg_flash_sector_size()) == 0);
+  if (!s_flash_irq_disabled) {
+    asm("cpsie i");  // // Reenable them after the call
+  }
+  MG_DEBUG(("Sector starting at %p erasure: %s", addr, ok ? "ok" : "fail"));
+  return ok;
+}
+
+MG_IRAM bool mg_flash_swap_bank() {
+  return true;
+}
+
+static inline void spin(volatile uint32_t count) {
+  while (count--) (void) 0;
+}
+
+// Note: This is the equivalent of uart_write_byte for LPUART2 (0x40188000u).
+// We use this because sometimes, when we read from the memory mapped
+// flash memory, the system crashes.
+static inline void read_init(void) {
+  *(uint32_t *) (0x40188000u + 0x1c) = 0;
+  while ((*(uint32_t *) (0x40188000u + 0x14) & 0x800000U) == 0) {
+    spin(1);
+  }
+}
+
+MG_IRAM bool mg_flash_write(void *addr, const void *buf, size_t len) {
+  flexspi_nor_config_t config;
+  if (flexspi_nor_get_config(&config) != 0) {
+    return false;
+  }
+  if ((len % mg_flash_write_align()) != 0) {
+    MG_ERROR(("%lu is not aligned to %lu", len, mg_flash_write_align()));
+    return false;
+  }
+  uint32_t *dst = (uint32_t *) addr;
+  uint32_t *src = (uint32_t *) buf;
+  uint32_t *end = (uint32_t *) ((char *) buf + len);
+  bool ok = true;
+
+  // Note: If we overwrite the flash irq section of the image, we must also
+  // make sure interrupts are disabled and are not reenabled until we write
+  // this sector with another irq table.
+#ifdef RUNINFLASH
+  if ((char *) addr == (char *) MG_FLASH_CODE_OFFSET) {
+    s_flash_irq_disabled = true;
+    asm("cpsid i");
+  }
+#endif
+
+  while (ok && src < end) {
+    if (flash_page_start(dst) && mg_flash_erase(dst) == false) {
+      break;
+    }
+    uint32_t status;
+    if ((char *) buf >= (char *) MG_FLASH_OFFSET) {
+      // If we copy from FLASH to FLASH, then we first need to copy the source
+      // to RAM
+      size_t tmp_buf_size = mg_flash_write_align() / sizeof(uint32_t);
+      uint32_t tmp[tmp_buf_size];
+      for (size_t i = 0; i < tmp_buf_size; i++) {
+        if (i == 0 && ((char *) addr >
+                       (char *) (MG_FLASH_OFFSET + MG_FLASH_CODE_OFFSET))) {
+          read_init();  // Ensure successful read from memory mapped flash
+        }
+        tmp[i] = src[i];
+      }
+      if (!s_flash_irq_disabled) {
+        asm("cpsid i");
+      }
+      status = flexspi_nor->program(FLEXSPI_NOR_INSTANCE, &config,
+                                    (uint32_t) dst, tmp);
+    } else {
+      if (!s_flash_irq_disabled) {
+        asm("cpsid i");
+      }
+      status = flexspi_nor->program(FLEXSPI_NOR_INSTANCE, &config,
+                                    (uint32_t) dst, src);
+    }
+    if (!s_flash_irq_disabled) {
+      asm("cpsie i");
+    }
+    src = (uint32_t *) ((char *) src + mg_flash_write_align());
+    dst = (uint32_t *) ((char *) dst + mg_flash_write_align());
+    if (status != 0) {
+      ok = false;
+    }
+  }
+  MG_DEBUG(("Flash write %lu bytes @ %p: %s.", len, dst, ok ? "ok" : "fail"));
+
+#ifdef RUNINFLASH
+  if ((char *) addr == (char *) MG_FLASH_CODE_OFFSET) {
+    s_flash_irq_disabled = false;
+    asm("cpsie i");
+  }
+#endif
+
+  return ok;
+}
+
+MG_IRAM void mg_device_reset(void) {
+  MG_DEBUG(("Resetting device..."));
+  *(volatile unsigned long *) 0xe000ed0c = 0x5fa0004;
+}
+
+#if MG_DEVICE == MG_DEVICE_RT1060
+MG_IRAM bool mg_flash_erase_all(void) {
+  flexspi_nor_config_t config;
+  if (flexspi_nor_get_config(&config) != 0) {
+    return false;
+  }
+  if (!s_flash_irq_disabled) {
+    asm("cpsid i");
+  }
+  bool ok = (flexspi_nor->erase_all(FLEXSPI_NOR_INSTANCE, &config) == 0);
+  if (!s_flash_irq_disabled) {
+    asm("cpsie i");
+  }
+  MG_DEBUG(("Chip erase: %s", ok ? "Success" : "Failure"));
+  return ok;
+}
+#endif
+
 #endif
 
 #ifdef MG_ENABLE_LINES
@@ -4189,6 +4413,288 @@ struct mg_connection *mg_mqtt_listen(struct mg_mgr *mgr, const char *url,
 }
 
 #ifdef MG_ENABLE_LINES
+#line 1 "src/net.c"
+#endif
+
+
+
+
+
+
+
+
+
+size_t mg_vprintf(struct mg_connection *c, const char *fmt, va_list *ap) {
+  size_t old = c->send.len;
+  mg_vxprintf(mg_pfn_iobuf, &c->send, fmt, ap);
+  return c->send.len - old;
+}
+
+size_t mg_printf(struct mg_connection *c, const char *fmt, ...) {
+  size_t len = 0;
+  va_list ap;
+  va_start(ap, fmt);
+  len = mg_vprintf(c, fmt, &ap);
+  va_end(ap);
+  return len;
+}
+
+static bool mg_atonl(struct mg_str str, struct mg_addr *addr) {
+  uint32_t localhost = mg_htonl(0x7f000001);
+  if (mg_vcasecmp(&str, "localhost") != 0) return false;
+  memcpy(addr->ip, &localhost, sizeof(uint32_t));
+  addr->is_ip6 = false;
+  return true;
+}
+
+static bool mg_atone(struct mg_str str, struct mg_addr *addr) {
+  if (str.len > 0) return false;
+  memset(addr->ip, 0, sizeof(addr->ip));
+  addr->is_ip6 = false;
+  return true;
+}
+
+static bool mg_aton4(struct mg_str str, struct mg_addr *addr) {
+  uint8_t data[4] = {0, 0, 0, 0};
+  size_t i, num_dots = 0;
+  for (i = 0; i < str.len; i++) {
+    if (str.ptr[i] >= '0' && str.ptr[i] <= '9') {
+      int octet = data[num_dots] * 10 + (str.ptr[i] - '0');
+      if (octet > 255) return false;
+      data[num_dots] = (uint8_t) octet;
+    } else if (str.ptr[i] == '.') {
+      if (num_dots >= 3 || i == 0 || str.ptr[i - 1] == '.') return false;
+      num_dots++;
+    } else {
+      return false;
+    }
+  }
+  if (num_dots != 3 || str.ptr[i - 1] == '.') return false;
+  memcpy(&addr->ip, data, sizeof(data));
+  addr->is_ip6 = false;
+  return true;
+}
+
+static bool mg_v4mapped(struct mg_str str, struct mg_addr *addr) {
+  int i;
+  uint32_t ipv4;
+  if (str.len < 14) return false;
+  if (str.ptr[0] != ':' || str.ptr[1] != ':' || str.ptr[6] != ':') return false;
+  for (i = 2; i < 6; i++) {
+    if (str.ptr[i] != 'f' && str.ptr[i] != 'F') return false;
+  }
+  // struct mg_str s = mg_str_n(&str.ptr[7], str.len - 7);
+  if (!mg_aton4(mg_str_n(&str.ptr[7], str.len - 7), addr)) return false;
+  memcpy(&ipv4, addr->ip, sizeof(ipv4));
+  memset(addr->ip, 0, sizeof(addr->ip));
+  addr->ip[10] = addr->ip[11] = 255;
+  memcpy(&addr->ip[12], &ipv4, 4);
+  addr->is_ip6 = true;
+  return true;
+}
+
+static bool mg_aton6(struct mg_str str, struct mg_addr *addr) {
+  size_t i, j = 0, n = 0, dc = 42;
+  addr->scope_id = 0;
+  if (str.len > 2 && str.ptr[0] == '[') str.ptr++, str.len -= 2;
+  if (mg_v4mapped(str, addr)) return true;
+  for (i = 0; i < str.len; i++) {
+    if ((str.ptr[i] >= '0' && str.ptr[i] <= '9') ||
+        (str.ptr[i] >= 'a' && str.ptr[i] <= 'f') ||
+        (str.ptr[i] >= 'A' && str.ptr[i] <= 'F')) {
+      unsigned long val;
+      if (i > j + 3) return false;
+      // MG_DEBUG(("%lu %lu [%.*s]", i, j, (int) (i - j + 1), &str.ptr[j]));
+      val = mg_unhexn(&str.ptr[j], i - j + 1);
+      addr->ip[n] = (uint8_t) ((val >> 8) & 255);
+      addr->ip[n + 1] = (uint8_t) (val & 255);
+    } else if (str.ptr[i] == ':') {
+      j = i + 1;
+      if (i > 0 && str.ptr[i - 1] == ':') {
+        dc = n;  // Double colon
+        if (i > 1 && str.ptr[i - 2] == ':') return false;
+      } else if (i > 0) {
+        n += 2;
+      }
+      if (n > 14) return false;
+      addr->ip[n] = addr->ip[n + 1] = 0;  // For trailing ::
+    } else if (str.ptr[i] == '%') {       // Scope ID
+      for (i = i + 1; i < str.len; i++) {
+        if (str.ptr[i] < '0' || str.ptr[i] > '9') return false;
+        addr->scope_id = (uint8_t) (addr->scope_id * 10);
+        addr->scope_id = (uint8_t) (addr->scope_id + (str.ptr[i] - '0'));
+      }
+    } else {
+      return false;
+    }
+  }
+  if (n < 14 && dc == 42) return false;
+  if (n < 14) {
+    memmove(&addr->ip[dc + (14 - n)], &addr->ip[dc], n - dc + 2);
+    memset(&addr->ip[dc], 0, 14 - n);
+  }
+
+  addr->is_ip6 = true;
+  return true;
+}
+
+bool mg_aton(struct mg_str str, struct mg_addr *addr) {
+  // MG_INFO(("[%.*s]", (int) str.len, str.ptr));
+  return mg_atone(str, addr) || mg_atonl(str, addr) || mg_aton4(str, addr) ||
+         mg_aton6(str, addr);
+}
+
+struct mg_connection *mg_alloc_conn(struct mg_mgr *mgr) {
+  struct mg_connection *c =
+      (struct mg_connection *) calloc(1, sizeof(*c) + mgr->extraconnsize);
+  if (c != NULL) {
+    c->mgr = mgr;
+    c->send.align = c->recv.align = c->rtls.align = MG_IO_SIZE;
+    c->id = ++mgr->nextid;
+    MG_PROF_INIT(c);
+  }
+  return c;
+}
+
+void mg_close_conn(struct mg_connection *c) {
+  mg_resolve_cancel(c);  // Close any pending DNS query
+  LIST_DELETE(struct mg_connection, &c->mgr->conns, c);
+  if (c == c->mgr->dns4.c) c->mgr->dns4.c = NULL;
+  if (c == c->mgr->dns6.c) c->mgr->dns6.c = NULL;
+  // Order of operations is important. `MG_EV_CLOSE` event must be fired
+  // before we deallocate received data, see #1331
+  mg_call(c, MG_EV_CLOSE, NULL);
+  MG_DEBUG(("%lu %ld closed", c->id, c->fd));
+  MG_PROF_DUMP(c);
+  MG_PROF_FREE(c);
+
+  mg_tls_free(c);
+  mg_iobuf_free(&c->recv);
+  mg_iobuf_free(&c->send);
+  mg_iobuf_free(&c->rtls);
+  mg_bzero((unsigned char *) c, sizeof(*c));
+  free(c);
+}
+
+struct mg_connection *mg_connect(struct mg_mgr *mgr, const char *url,
+                                 mg_event_handler_t fn, void *fn_data) {
+  struct mg_connection *c = NULL;
+  if (url == NULL || url[0] == '\0') {
+    MG_ERROR(("null url"));
+  } else if ((c = mg_alloc_conn(mgr)) == NULL) {
+    MG_ERROR(("OOM"));
+  } else {
+    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
+    c->is_udp = (strncmp(url, "udp:", 4) == 0);
+    c->fd = (void *) (size_t) MG_INVALID_SOCKET;
+    c->fn = fn;
+    c->is_client = true;
+    c->fn_data = fn_data;
+    MG_DEBUG(("%lu %ld %s", c->id, c->fd, url));
+    mg_call(c, MG_EV_OPEN, (void *) url);
+    mg_resolve(c, url);
+  }
+  return c;
+}
+
+struct mg_connection *mg_listen(struct mg_mgr *mgr, const char *url,
+                                mg_event_handler_t fn, void *fn_data) {
+  struct mg_connection *c = NULL;
+  if ((c = mg_alloc_conn(mgr)) == NULL) {
+    MG_ERROR(("OOM %s", url));
+  } else if (!mg_open_listener(c, url)) {
+    MG_ERROR(("Failed: %s, errno %d", url, errno));
+    MG_PROF_FREE(c);
+    free(c);
+    c = NULL;
+  } else {
+    c->is_listening = 1;
+    c->is_udp = strncmp(url, "udp:", 4) == 0;
+    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
+    c->fn = fn;
+    c->fn_data = fn_data;
+    mg_call(c, MG_EV_OPEN, NULL);
+    if (mg_url_is_ssl(url)) c->is_tls = 1;  // Accepted connection must
+    MG_DEBUG(("%lu %ld %s", c->id, c->fd, url));
+  }
+  return c;
+}
+
+struct mg_connection *mg_wrapfd(struct mg_mgr *mgr, int fd,
+                                mg_event_handler_t fn, void *fn_data) {
+  struct mg_connection *c = mg_alloc_conn(mgr);
+  if (c != NULL) {
+    c->fd = (void *) (size_t) fd;
+    c->fn = fn;
+    c->fn_data = fn_data;
+    MG_EPOLL_ADD(c);
+    mg_call(c, MG_EV_OPEN, NULL);
+    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
+  }
+  return c;
+}
+
+struct mg_timer *mg_timer_add(struct mg_mgr *mgr, uint64_t milliseconds,
+                              unsigned flags, void (*fn)(void *), void *arg) {
+  struct mg_timer *t = (struct mg_timer *) calloc(1, sizeof(*t));
+  if (t != NULL) {
+    mg_timer_init(&mgr->timers, t, milliseconds, flags, fn, arg);
+    t->id = mgr->timerid++;
+  }
+  return t;
+}
+
+long mg_io_recv(struct mg_connection *c, void *buf, size_t len) {
+  if (c->rtls.len == 0) return MG_IO_WAIT;
+  if (len > c->rtls.len) len = c->rtls.len;
+  memcpy(buf, c->rtls.buf, len);
+  mg_iobuf_del(&c->rtls, 0, len);
+  return (long) len;
+}
+
+void mg_mgr_free(struct mg_mgr *mgr) {
+  struct mg_connection *c;
+  struct mg_timer *tmp, *t = mgr->timers;
+  while (t != NULL) tmp = t->next, free(t), t = tmp;
+  mgr->timers = NULL;  // Important. Next call to poll won't touch timers
+  for (c = mgr->conns; c != NULL; c = c->next) c->is_closing = 1;
+  mg_mgr_poll(mgr, 0);
+#if MG_ENABLE_FREERTOS_TCP
+  FreeRTOS_DeleteSocketSet(mgr->ss);
+#endif
+  MG_DEBUG(("All connections closed"));
+#if MG_ENABLE_EPOLL
+  if (mgr->epoll_fd >= 0) close(mgr->epoll_fd), mgr->epoll_fd = -1;
+#endif
+  mg_tls_ctx_free(mgr);
+}
+
+void mg_mgr_init(struct mg_mgr *mgr) {
+  memset(mgr, 0, sizeof(*mgr));
+#if MG_ENABLE_EPOLL
+  if ((mgr->epoll_fd = epoll_create1(EPOLL_CLOEXEC)) < 0)
+    MG_ERROR(("epoll_create1 errno %d", errno));
+#else
+  mgr->epoll_fd = -1;
+#endif
+#if MG_ARCH == MG_ARCH_WIN32 && MG_ENABLE_WINSOCK
+  // clang-format off
+  { WSADATA data; WSAStartup(MAKEWORD(2, 2), &data); }
+  // clang-format on
+#elif MG_ENABLE_FREERTOS_TCP
+  mgr->ss = FreeRTOS_CreateSocketSet();
+#elif defined(__unix) || defined(__unix__) || defined(__APPLE__)
+  // Ignore SIGPIPE signal, so if client cancels the request, it
+  // won't kill the whole process.
+  signal(SIGPIPE, SIG_IGN);
+#endif
+  mgr->dnstimeout = 3000;
+  mgr->dns4.url = "udp://8.8.8.8:53";
+  mgr->dns6.url = "udp://[2001:4860:4860::8888]:53";
+  mg_tls_ctx_init(mgr);
+}
+
+#ifdef MG_ENABLE_LINES
 #line 1 "src/net_builtin.c"
 #endif
 
@@ -5298,288 +5804,6 @@ bool mg_send(struct mg_connection *c, const void *buf, size_t len) {
 #endif  // MG_ENABLE_TCPIP
 
 #ifdef MG_ENABLE_LINES
-#line 1 "src/net.c"
-#endif
-
-
-
-
-
-
-
-
-
-size_t mg_vprintf(struct mg_connection *c, const char *fmt, va_list *ap) {
-  size_t old = c->send.len;
-  mg_vxprintf(mg_pfn_iobuf, &c->send, fmt, ap);
-  return c->send.len - old;
-}
-
-size_t mg_printf(struct mg_connection *c, const char *fmt, ...) {
-  size_t len = 0;
-  va_list ap;
-  va_start(ap, fmt);
-  len = mg_vprintf(c, fmt, &ap);
-  va_end(ap);
-  return len;
-}
-
-static bool mg_atonl(struct mg_str str, struct mg_addr *addr) {
-  uint32_t localhost = mg_htonl(0x7f000001);
-  if (mg_vcasecmp(&str, "localhost") != 0) return false;
-  memcpy(addr->ip, &localhost, sizeof(uint32_t));
-  addr->is_ip6 = false;
-  return true;
-}
-
-static bool mg_atone(struct mg_str str, struct mg_addr *addr) {
-  if (str.len > 0) return false;
-  memset(addr->ip, 0, sizeof(addr->ip));
-  addr->is_ip6 = false;
-  return true;
-}
-
-static bool mg_aton4(struct mg_str str, struct mg_addr *addr) {
-  uint8_t data[4] = {0, 0, 0, 0};
-  size_t i, num_dots = 0;
-  for (i = 0; i < str.len; i++) {
-    if (str.ptr[i] >= '0' && str.ptr[i] <= '9') {
-      int octet = data[num_dots] * 10 + (str.ptr[i] - '0');
-      if (octet > 255) return false;
-      data[num_dots] = (uint8_t) octet;
-    } else if (str.ptr[i] == '.') {
-      if (num_dots >= 3 || i == 0 || str.ptr[i - 1] == '.') return false;
-      num_dots++;
-    } else {
-      return false;
-    }
-  }
-  if (num_dots != 3 || str.ptr[i - 1] == '.') return false;
-  memcpy(&addr->ip, data, sizeof(data));
-  addr->is_ip6 = false;
-  return true;
-}
-
-static bool mg_v4mapped(struct mg_str str, struct mg_addr *addr) {
-  int i;
-  uint32_t ipv4;
-  if (str.len < 14) return false;
-  if (str.ptr[0] != ':' || str.ptr[1] != ':' || str.ptr[6] != ':') return false;
-  for (i = 2; i < 6; i++) {
-    if (str.ptr[i] != 'f' && str.ptr[i] != 'F') return false;
-  }
-  // struct mg_str s = mg_str_n(&str.ptr[7], str.len - 7);
-  if (!mg_aton4(mg_str_n(&str.ptr[7], str.len - 7), addr)) return false;
-  memcpy(&ipv4, addr->ip, sizeof(ipv4));
-  memset(addr->ip, 0, sizeof(addr->ip));
-  addr->ip[10] = addr->ip[11] = 255;
-  memcpy(&addr->ip[12], &ipv4, 4);
-  addr->is_ip6 = true;
-  return true;
-}
-
-static bool mg_aton6(struct mg_str str, struct mg_addr *addr) {
-  size_t i, j = 0, n = 0, dc = 42;
-  addr->scope_id = 0;
-  if (str.len > 2 && str.ptr[0] == '[') str.ptr++, str.len -= 2;
-  if (mg_v4mapped(str, addr)) return true;
-  for (i = 0; i < str.len; i++) {
-    if ((str.ptr[i] >= '0' && str.ptr[i] <= '9') ||
-        (str.ptr[i] >= 'a' && str.ptr[i] <= 'f') ||
-        (str.ptr[i] >= 'A' && str.ptr[i] <= 'F')) {
-      unsigned long val;
-      if (i > j + 3) return false;
-      // MG_DEBUG(("%lu %lu [%.*s]", i, j, (int) (i - j + 1), &str.ptr[j]));
-      val = mg_unhexn(&str.ptr[j], i - j + 1);
-      addr->ip[n] = (uint8_t) ((val >> 8) & 255);
-      addr->ip[n + 1] = (uint8_t) (val & 255);
-    } else if (str.ptr[i] == ':') {
-      j = i + 1;
-      if (i > 0 && str.ptr[i - 1] == ':') {
-        dc = n;  // Double colon
-        if (i > 1 && str.ptr[i - 2] == ':') return false;
-      } else if (i > 0) {
-        n += 2;
-      }
-      if (n > 14) return false;
-      addr->ip[n] = addr->ip[n + 1] = 0;  // For trailing ::
-    } else if (str.ptr[i] == '%') {       // Scope ID
-      for (i = i + 1; i < str.len; i++) {
-        if (str.ptr[i] < '0' || str.ptr[i] > '9') return false;
-        addr->scope_id = (uint8_t) (addr->scope_id * 10);
-        addr->scope_id = (uint8_t) (addr->scope_id + (str.ptr[i] - '0'));
-      }
-    } else {
-      return false;
-    }
-  }
-  if (n < 14 && dc == 42) return false;
-  if (n < 14) {
-    memmove(&addr->ip[dc + (14 - n)], &addr->ip[dc], n - dc + 2);
-    memset(&addr->ip[dc], 0, 14 - n);
-  }
-
-  addr->is_ip6 = true;
-  return true;
-}
-
-bool mg_aton(struct mg_str str, struct mg_addr *addr) {
-  // MG_INFO(("[%.*s]", (int) str.len, str.ptr));
-  return mg_atone(str, addr) || mg_atonl(str, addr) || mg_aton4(str, addr) ||
-         mg_aton6(str, addr);
-}
-
-struct mg_connection *mg_alloc_conn(struct mg_mgr *mgr) {
-  struct mg_connection *c =
-      (struct mg_connection *) calloc(1, sizeof(*c) + mgr->extraconnsize);
-  if (c != NULL) {
-    c->mgr = mgr;
-    c->send.align = c->recv.align = c->rtls.align = MG_IO_SIZE;
-    c->id = ++mgr->nextid;
-    MG_PROF_INIT(c);
-  }
-  return c;
-}
-
-void mg_close_conn(struct mg_connection *c) {
-  mg_resolve_cancel(c);  // Close any pending DNS query
-  LIST_DELETE(struct mg_connection, &c->mgr->conns, c);
-  if (c == c->mgr->dns4.c) c->mgr->dns4.c = NULL;
-  if (c == c->mgr->dns6.c) c->mgr->dns6.c = NULL;
-  // Order of operations is important. `MG_EV_CLOSE` event must be fired
-  // before we deallocate received data, see #1331
-  mg_call(c, MG_EV_CLOSE, NULL);
-  MG_DEBUG(("%lu %ld closed", c->id, c->fd));
-  MG_PROF_DUMP(c);
-  MG_PROF_FREE(c);
-
-  mg_tls_free(c);
-  mg_iobuf_free(&c->recv);
-  mg_iobuf_free(&c->send);
-  mg_iobuf_free(&c->rtls);
-  mg_bzero((unsigned char *) c, sizeof(*c));
-  free(c);
-}
-
-struct mg_connection *mg_connect(struct mg_mgr *mgr, const char *url,
-                                 mg_event_handler_t fn, void *fn_data) {
-  struct mg_connection *c = NULL;
-  if (url == NULL || url[0] == '\0') {
-    MG_ERROR(("null url"));
-  } else if ((c = mg_alloc_conn(mgr)) == NULL) {
-    MG_ERROR(("OOM"));
-  } else {
-    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
-    c->is_udp = (strncmp(url, "udp:", 4) == 0);
-    c->fd = (void *) (size_t) MG_INVALID_SOCKET;
-    c->fn = fn;
-    c->is_client = true;
-    c->fn_data = fn_data;
-    MG_DEBUG(("%lu %ld %s", c->id, c->fd, url));
-    mg_call(c, MG_EV_OPEN, (void *) url);
-    mg_resolve(c, url);
-  }
-  return c;
-}
-
-struct mg_connection *mg_listen(struct mg_mgr *mgr, const char *url,
-                                mg_event_handler_t fn, void *fn_data) {
-  struct mg_connection *c = NULL;
-  if ((c = mg_alloc_conn(mgr)) == NULL) {
-    MG_ERROR(("OOM %s", url));
-  } else if (!mg_open_listener(c, url)) {
-    MG_ERROR(("Failed: %s, errno %d", url, errno));
-    MG_PROF_FREE(c);
-    free(c);
-    c = NULL;
-  } else {
-    c->is_listening = 1;
-    c->is_udp = strncmp(url, "udp:", 4) == 0;
-    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
-    c->fn = fn;
-    c->fn_data = fn_data;
-    mg_call(c, MG_EV_OPEN, NULL);
-    if (mg_url_is_ssl(url)) c->is_tls = 1;  // Accepted connection must
-    MG_DEBUG(("%lu %ld %s", c->id, c->fd, url));
-  }
-  return c;
-}
-
-struct mg_connection *mg_wrapfd(struct mg_mgr *mgr, int fd,
-                                mg_event_handler_t fn, void *fn_data) {
-  struct mg_connection *c = mg_alloc_conn(mgr);
-  if (c != NULL) {
-    c->fd = (void *) (size_t) fd;
-    c->fn = fn;
-    c->fn_data = fn_data;
-    MG_EPOLL_ADD(c);
-    mg_call(c, MG_EV_OPEN, NULL);
-    LIST_ADD_HEAD(struct mg_connection, &mgr->conns, c);
-  }
-  return c;
-}
-
-struct mg_timer *mg_timer_add(struct mg_mgr *mgr, uint64_t milliseconds,
-                              unsigned flags, void (*fn)(void *), void *arg) {
-  struct mg_timer *t = (struct mg_timer *) calloc(1, sizeof(*t));
-  if (t != NULL) {
-    mg_timer_init(&mgr->timers, t, milliseconds, flags, fn, arg);
-    t->id = mgr->timerid++;
-  }
-  return t;
-}
-
-long mg_io_recv(struct mg_connection *c, void *buf, size_t len) {
-  if (c->rtls.len == 0) return MG_IO_WAIT;
-  if (len > c->rtls.len) len = c->rtls.len;
-  memcpy(buf, c->rtls.buf, len);
-  mg_iobuf_del(&c->rtls, 0, len);
-  return (long) len;
-}
-
-void mg_mgr_free(struct mg_mgr *mgr) {
-  struct mg_connection *c;
-  struct mg_timer *tmp, *t = mgr->timers;
-  while (t != NULL) tmp = t->next, free(t), t = tmp;
-  mgr->timers = NULL;  // Important. Next call to poll won't touch timers
-  for (c = mgr->conns; c != NULL; c = c->next) c->is_closing = 1;
-  mg_mgr_poll(mgr, 0);
-#if MG_ENABLE_FREERTOS_TCP
-  FreeRTOS_DeleteSocketSet(mgr->ss);
-#endif
-  MG_DEBUG(("All connections closed"));
-#if MG_ENABLE_EPOLL
-  if (mgr->epoll_fd >= 0) close(mgr->epoll_fd), mgr->epoll_fd = -1;
-#endif
-  mg_tls_ctx_free(mgr);
-}
-
-void mg_mgr_init(struct mg_mgr *mgr) {
-  memset(mgr, 0, sizeof(*mgr));
-#if MG_ENABLE_EPOLL
-  if ((mgr->epoll_fd = epoll_create1(EPOLL_CLOEXEC)) < 0)
-    MG_ERROR(("epoll_create1 errno %d", errno));
-#else
-  mgr->epoll_fd = -1;
-#endif
-#if MG_ARCH == MG_ARCH_WIN32 && MG_ENABLE_WINSOCK
-  // clang-format off
-  { WSADATA data; WSAStartup(MAKEWORD(2, 2), &data); }
-  // clang-format on
-#elif MG_ENABLE_FREERTOS_TCP
-  mgr->ss = FreeRTOS_CreateSocketSet();
-#elif defined(__unix) || defined(__unix__) || defined(__APPLE__)
-  // Ignore SIGPIPE signal, so if client cancels the request, it
-  // won't kill the whole process.
-  signal(SIGPIPE, SIG_IGN);
-#endif
-  mgr->dnstimeout = 3000;
-  mgr->dns4.url = "udp://8.8.8.8:53";
-  mgr->dns6.url = "udp://[2001:4860:4860::8888]:53";
-  mg_tls_ctx_init(mgr);
-}
-
-#ifdef MG_ENABLE_LINES
 #line 1 "src/ota_dummy.c"
 #endif
 
@@ -5702,7 +5926,7 @@ bool mg_ota_end(void) {
   bool ok = false;
   if (s_size) {
     size_t size = s_addr - base;
-    uint32_t crc32 = mg_crc32(0, base, s_size);
+    uint32_t crc32 = mg_crc32(0, base + MG_FLASH_OFFSET, s_size);
     if (size == s_size && crc32 == s_crc32) {
       uint32_t now = (uint32_t) (mg_now() / 1000);
       struct mg_otadata od = {crc32, size, now, MG_OTA_FIRST_BOOT};
@@ -5815,15 +6039,125 @@ MG_IRAM void mg_ota_boot(void) {
     (void) tmpsector;
     for (ofs = 0; ofs < max; ofs += ss) {
       // mg_flash_erase(tmpsector);
-      mg_flash_write(tmpsector, partition1 + ofs, ss);
+      mg_flash_write(tmpsector, partition1 + ofs + MG_FLASH_OFFSET, ss);
       // mg_flash_erase(partition1 + ofs);
-      mg_flash_write(partition1 + ofs, partition2 + ofs, ss);
+      mg_flash_write(partition1 + ofs, partition2 + ofs + MG_FLASH_OFFSET, ss);
       // mg_flash_erase(partition2 + ofs);
-      mg_flash_write(partition2 + ofs, tmpsector, ss);
+      mg_flash_write(partition2 + ofs, tmpsector + MG_FLASH_OFFSET, ss);
     }
     mg_device_reset();
   }
 }
+
+#elif MG_OTA == MG_OTA_FLASH_FROM_RAM
+
+#define MG_OTADATA_KEY 0xb07afed0
+
+static char *s_addr;      // Current address to write to
+static size_t s_size;     // Firmware size to flash. In-progress indicator
+static uint32_t s_crc32;  // Firmware checksum
+
+struct mg_otadata {
+  uint32_t crc32, size, timestamp, status;
+};
+
+bool mg_ota_begin(size_t new_firmware_size) {
+  bool ok = false;
+  if (s_size) {
+    MG_ERROR(("OTA already in progress. Call mg_ota_end()"));
+  } else {
+    if (new_firmware_size > mg_flash_size()) {
+      MG_ERROR(("Firmware exceeds flash size"));
+      return false;
+    }
+    s_size = new_firmware_size;
+    uint32_t flash_init_status = mg_flash_init();
+    if (flash_init_status) {
+      MG_ERROR(("Error initialising the flash structure"));
+      return false;
+    } else {
+      ok = true;
+    }
+  }
+  return ok;
+}
+
+bool mg_ota_write(const void *buf, size_t len) {
+  bool ok = false;
+  if (s_size == 0) {
+    MG_ERROR(("OTA is not started, call mg_ota_begin()"));
+  } else {
+    size_t align = mg_flash_write_align();
+    size_t len_aligned_down = MG_ROUND_DOWN(len, align);
+    if (len_aligned_down) ok = mg_flash_write(s_addr, buf, len_aligned_down);
+    if (len_aligned_down < len) {
+      size_t left = len - len_aligned_down;
+      char tmp[align];
+      memset(tmp, 0xff, sizeof(tmp));
+      memcpy(tmp, (char *) buf + len_aligned_down, left);
+      ok = mg_flash_write(s_addr + len_aligned_down, tmp, sizeof(tmp));
+    }
+    s_crc32 = mg_crc32(s_crc32, (char *) buf, len);  // Update CRC
+    MG_DEBUG(("%#x %p %lu -> %d", s_addr, buf, len, ok));
+    s_addr += len;
+  }
+  return ok;
+}
+
+bool mg_ota_end(void) {
+  bool ok = true;
+  size_t size = (size_t) s_addr;
+  uint32_t crc32 = mg_crc32(0, (char *) 0x60000000, size);
+  MG_DEBUG(("Saving fw key"));
+  if (size == s_size && crc32 == s_crc32) {
+      uint32_t now = (uint32_t) (mg_now() / 1000);
+      struct mg_otadata od = {crc32, size, now, MG_OTA_FIRST_BOOT};
+      uint32_t key = MG_OTADATA_KEY + MG_FIRMWARE_CURRENT;
+      ok = mg_flash_save(NULL, key, &od, sizeof(od));
+    }
+  MG_DEBUG(("CRC: %x/%x, size: %lu/%lu, status: %s", s_crc32, crc32, s_size,
+              size, s_crc32 == crc32 ? "ok" : "fail"));
+  s_addr = 0;
+  s_size = 0;
+  MG_INFO(("Finishing OTA: %s", ok ? "ok" : "fail"));
+  return ok;
+}
+
+static struct mg_otadata mg_otadata(int fw) {
+  (void) fw;
+  struct mg_otadata od = {};
+  return od;
+}
+
+int mg_ota_status(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.status;
+}
+
+uint32_t mg_ota_crc32(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.crc32;
+}
+
+uint32_t mg_ota_timestamp(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.timestamp;
+}
+
+size_t mg_ota_size(int fw) {
+  struct mg_otadata od = mg_otadata(fw);
+  return od.size;
+}
+
+bool mg_ota_commit(void) {
+  return false;
+}
+
+bool mg_ota_rollback(void) {
+  MG_DEBUG(("Rolling firmware not supported yet"));
+  return false;
+}
+
 #endif
 
 #ifdef MG_ENABLE_LINES

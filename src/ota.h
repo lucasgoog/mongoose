@@ -7,6 +7,7 @@
 
 #define MG_OTA_NONE 0      // No OTA support
 #define MG_OTA_FLASH 1     // OTA via an internal flash
+#define MG_OTA_FLASH_FROM_RAM 2 // OTA write to external flash from RAM
 #define MG_OTA_CUSTOM 100  // Custom implementation
 
 #ifndef MG_OTA

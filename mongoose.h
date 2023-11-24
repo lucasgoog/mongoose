@@ -2627,6 +2627,7 @@ void mg_rpc_list(struct mg_rpc_req *r);
 
 #define MG_OTA_NONE 0      // No OTA support
 #define MG_OTA_FLASH 1     // OTA via an internal flash
+#define MG_OTA_FLASH_FROM_RAM 2 // OTA write to external flash from RAM
 #define MG_OTA_CUSTOM 100  // Custom implementation
 
 #ifndef MG_OTA
@@ -2670,11 +2671,20 @@ MG_IRAM void mg_ota_boot(void);  // Bootloader function
 #define MG_DEVICE_NONE 0        // Dummy system
 #define MG_DEVICE_STM32H5 1     // STM32 H5
 #define MG_DEVICE_STM32H7 2     // STM32 H7
+#define MG_DEVICE_RT1020 3      // IMXRT1020
+#define MG_DEVICE_RT1060 4      // IMXRT1060
 #define MG_DEVICE_CH32V307 100  // WCH CH32V307
 #define MG_DEVICE_CUSTOM 1000   // Custom implementation
 
 #ifndef MG_DEVICE
 #define MG_DEVICE MG_DEVICE_NONE
+#endif
+
+#if MG_DEVICE == MG_DEVICE_RT1020 || MG_DEVICE == MG_DEVICE_RT1060
+#define MG_FLASH_OFFSET 0x60000000  // Offset to memory mapped flash
+#define MG_FLASH_CODE_OFFSET 0x2000 // Offset to code from start of flash
+#else
+#define MG_FLASH_OFFSET 0
 #endif
 
 // Flash information

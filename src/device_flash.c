@@ -1,6 +1,7 @@
 #include "device.h"
 
-#if MG_DEVICE == MG_DEVICE_STM32H7 || MG_DEVICE == MG_DEVICE_STM32H5
+#if MG_DEVICE == MG_DEVICE_STM32H7 || MG_DEVICE == MG_DEVICE_STM32H5 || \
+    MG_DEVICE == MG_DEVICE_RT1020 || MG_DEVICE == MG_DEVICE_RT1060
 // Flash can be written only if it is erased. Erased flash is 0xff (all bits 1)
 // Writes must be mg_flash_write_align() - aligned. Thus if we want to save an
 // object, we pad it at the end for alignment.
@@ -33,10 +34,11 @@ static char *flash_last_sector(void) {
 
 // Find a saved object with a given key
 bool mg_flash_load(void *sector, uint32_t key, void *buf, size_t len) {
-  char *base = (char *) mg_flash_start(), *s = (char *) sector, *res = NULL;
+  char *base = (char *) mg_flash_start() + MG_FLASH_OFFSET;
+  char *s = (char *) sector, *res = NULL;
   size_t ss = mg_flash_sector_size(), ofs = 0, n, sz;
   bool ok = false;
-  if (s == NULL) s = flash_last_sector();
+  if (sector == NULL) s = flash_last_sector() + MG_FLASH_OFFSET;
   if (s < base || s >= base + mg_flash_size()) {
     MG_ERROR(("%p is outsize of flash", sector));
   } else if (((s - base) % ss) != 0) {
@@ -68,7 +70,8 @@ static void mg_flash_sector_cleanup(char *sector) {
   uint32_t key;
   // Traverse all objects
   MG_DEBUG(("Cleaning up sector %p", sector));
-  while ((n = mg_flash_next(sector + ofs, sector + ss, &key, &size)) > 0) {
+  while ((n = mg_flash_next(sector + ofs + MG_FLASH_OFFSET,
+                            sector + ss + MG_FLASH_OFFSET, &key, &size)) > 0) {
     // Delete an old copy of this object in the cache
     for (size_t o = 0; o < io.len; o += size2 + hs) {
       uint32_t k = *(uint32_t *) (io.buf + o + sizeof(uint32_t));
@@ -79,7 +82,7 @@ static void mg_flash_sector_cleanup(char *sector) {
       }
     }
     // And add the new copy
-    mg_iobuf_add(&io, io.len, sector + ofs, size + hs);
+    mg_iobuf_add(&io, io.len, sector + ofs + MG_FLASH_OFFSET, size + hs);
     ofs += n;
   }
   // All objects are cached in RAM now
@@ -108,13 +111,17 @@ bool mg_flash_save(void *sector, uint32_t key, const void *buf, size_t len) {
     uint32_t hdr[2] = {(uint32_t) len, key};
     size_t needed = sizeof(hdr) + len;
     size_t needed_aligned = MG_ROUND_UP(needed, sizeof(ab));
-    while ((n = mg_flash_next(s + ofs, s + ss, NULL, NULL)) > 0) ofs += n;
+    while ((n = mg_flash_next(s + ofs + MG_FLASH_OFFSET,
+                              s + ss + MG_FLASH_OFFSET, NULL, NULL)) > 0)
+      ofs += n;
 
     // If there is not enough space left, cleanup sector and re-eval ofs
-    if (ofs + needed_aligned > ss) {
+    if (ofs + needed_aligned >= ss) {
       mg_flash_sector_cleanup(s);
       ofs = 0;
-      while ((n = mg_flash_next(s + ofs, s + ss, NULL, NULL)) > 0) ofs += n;
+      while ((n = mg_flash_next(s + ofs + MG_FLASH_OFFSET,
+                                s + ss + MG_FLASH_OFFSET, NULL, NULL)) > 0)
+        ofs += n;
     }
 
     if (ofs + needed_aligned <= ss) {

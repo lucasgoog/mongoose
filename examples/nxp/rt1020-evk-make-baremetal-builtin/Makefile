@@ -4,29 +4,44 @@ CFLAGS += -g3 -Os -ffunction-sections -fdata-sections
 CFLAGS += -I. -Icmsis_core/CMSIS/Core/Include -Icmsis_mcu/devices/MIMXRT1021 #-DCPU_MIMXRT1021DAG5A
 CFLAGS += -mcpu=cortex-m7 -mthumb -mfloat-abi=hard -mfpu=fpv5-d16 $(CFLAGS_EXTRA)
 LDSCRIPT = link_ram.ld
-LDFLAGS ?= -T$(LDSCRIPT) -nostdlib -nostartfiles --specs nano.specs -lc -lgcc -Wl,--gc-sections -Wl,-Map=$@.map 
+LDFLAGS ?= -T$(LDSCRIPT) -nostdlib -nostartfiles --specs nano.specs -lc -lgcc -Wl,--gc-sections -Wl,-Map=$@.map
+
+PACK = ./pack             # Utility to pack files into a packed filesystem
+PACK_CC = gcc
+PACK_OBJ_COPY = arm-none-eabi-objcopy
+PACK_COPY_FLAGS = -O binary --only-section=.iram
+PACK_TMP = tmp.bin
+PACK_EXTRACT = awk '/static const unsigned char v1\[\]/,/};/ { gsub("static const unsigned char v1", "const unsigned char ramcode"); print }'
 
 SOURCES = main.c syscalls.c sysinit.c
 SOURCES += cmsis_mcu/devices/MIMXRT1021/gcc/startup_MIMXRT1021.S # NXP startup file. Compiler-dependent!
 CFLAGS += -D__ATOLLIC__ -D__STARTUP_CLEAR_BSS	# Make startup code work as expected
 
 # Mongoose options are defined in mongoose_custom.h
-SOURCES += mongoose.c
+SOURCES += mongoose.c net.c
 
 # Example specific build options. See README.md
 CFLAGS += -DHTTP_URL=\"http://0.0.0.0/\" -DHTTPS_URL=\"https://0.0.0.0/\"
 
 ifeq ($(OS),Windows_NT)
   RM = cmd /C del /Q /F /S
+  PACK = pack.exe
 else
   RM = rm -rf
 endif
 
+pack: firmware.elf
+	$(PACK_CC) ../../../test/pack.c -o $(PACK)
+	$(PACK_OBJ_COPY) $(PACK_COPY_FLAGS) $< $(PACK_TMP)
+	$(PACK) $(PACK_TMP) | $(PACK_EXTRACT) > itcram.h
+	$(RM) $(PACK_TMP) $(PACK)
+
 all build example: firmware.bin
 
 image: LDSCRIPT = link.ld
-image: SOURCES += flash_image.c net.c packed_fs.c # no room to run dashboard in RAM w/ default config
+image: SOURCES += flash_image.c packed_fs.c # no room to run dashboard in RAM w/ default config
 image: CFLAGS += -DRUNINFLASH
+image: CFLAGS += -DUART_DEBUG=LPUART2
 image: firmware.bin
 
 firmware.bin: firmware.elf

@@ -186,4 +186,3 @@ clean: clean_examples clean_embedded
 
 clean_embedded:
 	for X in $(EXAMPLES_EMBEDDED); do test -f $$X/Makefile || continue; $(MAKE) -C $$X clean || exit 1; done
-
