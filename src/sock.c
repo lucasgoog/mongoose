@@ -362,6 +362,11 @@ void mg_connect_resolved(struct mg_connection *c) {
   if (FD(c) == MG_INVALID_SOCKET) {
     mg_error(c, "socket(): %d", MG_SOCK_ERR(-1));
   } else if (c->is_udp) {
+    // union usa usa;
+    // socklen_t slen = tousa(&c->rem, &usa);
+    // connect(FD(c), &usa.sa, slen);
+    // socklen_t slen = tousa(&c->rem, &usa);
+    // setlocaddr(FD(c), &c->loc);
     MG_EPOLL_ADD(c);
 #if MG_ARCH == MG_ARCH_TIRTOS
     union usa usa;  // TI-RTOS NDK requires binding to receive on UDP sockets
@@ -587,6 +592,87 @@ static void mg_iotest(struct mg_mgr *mgr, int ms) {
     }
   }
 #endif
+}
+
+static bool mg_socketpair(MG_SOCKET_TYPE sp[2], union usa usa[2]) {
+  socklen_t n = sizeof(usa[0].sin);
+  bool success = false;
+
+  sp[0] = sp[1] = MG_INVALID_SOCKET;
+  (void) memset(&usa[0], 0, sizeof(usa[0]));
+  usa[0].sin.sin_family = AF_INET;
+  *(uint32_t *) &usa->sin.sin_addr = mg_htonl(0x7f000001U);  // 127.0.0.1
+  usa[1] = usa[0];
+
+  if ((sp[0] = socket(AF_INET, SOCK_DGRAM, 0)) != MG_INVALID_SOCKET &&
+      (sp[1] = socket(AF_INET, SOCK_DGRAM, 0)) != MG_INVALID_SOCKET &&
+      bind(sp[0], &usa[0].sa, n) == 0 &&          //
+      bind(sp[1], &usa[1].sa, n) == 0 &&          //
+      getsockname(sp[0], &usa[0].sa, &n) == 0 &&  //
+      getsockname(sp[1], &usa[1].sa, &n) == 0 &&  //
+      connect(sp[0], &usa[1].sa, n) == 0 &&       //
+      connect(sp[1], &usa[0].sa, n) == 0) {       //
+    success = true;
+  }
+  if (!success) {
+    if (sp[0] != MG_INVALID_SOCKET) closesocket(sp[0]);
+    if (sp[1] != MG_INVALID_SOCKET) closesocket(sp[1]);
+    sp[0] = sp[1] = MG_INVALID_SOCKET;
+  }
+  return success;
+}
+
+// mg_wakeup() event handler
+static void wufn(struct mg_connection *c, int ev, void *evd, void *fnd) {
+  if (ev == MG_EV_READ) {
+    unsigned long *id = (unsigned long *) c->recv.buf;
+    // MG_INFO(("Got data"));
+    // mg_hexdump(c->recv.buf, c->recv.len);
+    if (c->recv.len >= sizeof(*id)) {
+      struct mg_connection *t;
+      for (t = c->mgr->conns; t != NULL; t = t->next) {
+        if (t->id == *id) {
+          struct mg_str data = mg_str_n((char *) c->recv.buf + sizeof(*id),
+                                        c->recv.len - sizeof(*id));
+          mg_call(t, MG_EV_WAKEUP, &data);
+        }
+      }
+    }
+    c->recv.len = 0;  // Consume received data
+  } else if (ev == MG_EV_CLOSE) {
+    closesocket(c->mgr->pipe);         // When we're closing, close the other
+    c->mgr->pipe = MG_INVALID_SOCKET;  // side of the socketpair, too
+  }
+  (void) evd, (void) fnd;
+}
+
+bool mg_wakeup(struct mg_mgr *mgr, unsigned long conn_id, const void *buf,
+               size_t len) {
+  // If socket pair is not yet created, create it
+  if (mgr->pipe == MG_INVALID_SOCKET) {
+    union usa usa[2];
+    MG_SOCKET_TYPE sp[2] = {MG_INVALID_SOCKET, MG_INVALID_SOCKET};
+    struct mg_connection *c = NULL;
+    if (!mg_socketpair(sp, usa)) {
+      MG_ERROR(("Cannot create socket pair"));
+    } else if ((c = mg_wrapfd(mgr, (int) sp[1], wufn, NULL)) == NULL) {
+      closesocket(sp[0]);
+      closesocket(sp[1]);
+      sp[0] = sp[1] = MG_INVALID_SOCKET;
+    } else {
+      tomgaddr(&usa[0], &c->rem, false);
+      MG_DEBUG(("%lu %p pipe %lu", c->id, c->fd, (unsigned long) sp[0]));
+      mgr->pipe = sp[0];
+    }
+  }
+  if (mgr->pipe != MG_INVALID_SOCKET && conn_id > 0) {
+    char *extended_buf = (char *) alloca(len + sizeof(conn_id));
+    memcpy(extended_buf, &conn_id, sizeof(conn_id));
+    memcpy(extended_buf + sizeof(conn_id), buf, len);
+    send(mgr->pipe, extended_buf, len + sizeof(conn_id), MSG_NONBLOCKING);
+    return true;
+  }
+  return false;
 }
 
 void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
